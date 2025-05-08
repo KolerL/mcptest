@@ -12,6 +12,7 @@ from openai import AsyncOpenAI
 from dotenv import load_dotenv
 from data_loader import LocalKnowledge
 import base64
+import re
 
 load_dotenv()
 
@@ -27,6 +28,7 @@ class MCPClient:
         self.knowledge = LocalKnowledge(knowledge_path)
         self.pdf_text = ""
         self.current_image = None
+        self.image_analysis_text = None
 
     async def connect_to_sse_server(self, server_url: str):
         """Connect to an MCP server running with SSE transport"""
@@ -83,7 +85,7 @@ class MCPClient:
         except Exception as e:
             print(f"\n**处理过程中发生错误：{str(e)}")
 
-    async def analyze_image(self, image_path: str, question: str = "请分析这张图片的内容，并提供详细描述。") -> str:
+    async def analyze_image(self, image_path: str, question: str = "如果图片识别到的是问题，按以下格式返回：1. 问题一？\n2. 问题二？，否则请分析这张图片的内容，并提供详细描述。") -> str:
         """Analyze image using OpenAI's Vision API"""
         try:
             # Read and encode the image
@@ -92,31 +94,122 @@ class MCPClient:
             
             self.current_image = base64_image
             
-            response = await self.openai.chat.completions.create(
+            # 判断是否是要解答图片中的问题
+            intent_response = await self.openai.chat.completions.create(
                 model="gpt-4.1",
                 messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": question},
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/jpeg;base64,{base64_image}"
-                                }
-                            }
-                        ]
-                    }
+                    {"role": "system", "content": "判断用户输入是否表达了'解决/回答图片中的问题'这个意图,如果是返回true,否则返回false"},
+                    {"role": "user", "content": question}
                 ],
-                max_tokens=500
+                temperature=0,
+                max_tokens=10
             )
-            return response.choices[0].message.content
+            is_solve_image_questions = intent_response.choices[0].message.content.strip().lower() == "true"
+
+            if is_solve_image_questions:
+                # 首先获取图片中的问题
+                response = await self.openai.chat.completions.create(
+                    model="gpt-4.1",
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "请从图片中提取问题，按以下格式返回：1. 问题一？\n2. 问题二？"},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": f"data:image/jpeg;base64,{base64_image}"
+                                    }
+                                }
+                            ]
+                        }
+                    ],
+                    max_tokens=500
+                )
+                analysis_result = response.choices[0].message.content
+                self.image_analysis_text = analysis_result  # 保存分析结果
+                
+                # 从图片分析文本中提取问题
+                questions = await self._extract_questions(self.image_analysis_text)
+                if questions:
+                    # 处理每个问题,优先从本地知识库查找答案
+                    return await self._process_multiple_questions(questions)
+                else:
+                    return "未从图片中识别到有效问题，请尝试重新分析图片"
+            else:
+                # 直接分析图片内容
+                response = await self.openai.chat.completions.create(
+                    model="gpt-4.1",
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": question},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": f"data:image/jpeg;base64,{base64_image}"
+                                    }
+                                }
+                            ]
+                        }
+                    ],
+                    max_tokens=500
+                )
+                analysis_result = response.choices[0].message.content
+                self.image_analysis_text = analysis_result  # 保存分析结果
+                return analysis_result
         except Exception as e:
             return f"图片分析出错: {str(e)}"
 
     async def process_query(self, query: str) -> str:
         """Process a query using OpenAI API and available tools"""
-        # 本地知识搜索
+        # 判断是否是图片相关问题
+        if self.current_image and "图片" in query:
+            # 判断是否是要解答图片中的问题
+            intent_response = await self.openai.chat.completions.create(
+                model="gpt-4.1",
+                messages=[
+                    {"role": "system", "content": "判断用户输入是否表达了'解决/回答图片中的问题'这个意图,如果是返回true,否则返回false"},
+                    {"role": "user", "content": query}
+                ],
+                temperature=0,
+                max_tokens=10
+            )
+            is_solve_image_questions = intent_response.choices[0].message.content.strip().lower() == "true"
+            
+            if is_solve_image_questions and self.image_analysis_text:
+                # 从图片分析文本中提取问题
+                questions = await self._extract_questions(self.image_analysis_text)
+                if questions:
+                    # 处理每个问题,优先从本地知识库查找答案
+                    return await self._process_multiple_questions(questions)
+                else:
+                    return "未从图片中识别到有效问题，请尝试重新分析图片"
+            else:
+                # 直接用大模型回答图片相关问题
+                response = await self.openai.chat.completions.create(
+                    model="gpt-4.1",
+                    messages=[
+                        {"role": "system", "content": "你是一个专业的图片分析助手，请针对用户的问题分析图片内容并给出回答。"},
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": query},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": f"data:image/jpeg;base64,{self.current_image}"
+                                    }
+                                }
+                            ]
+                        }
+                    ],
+                    max_tokens=500
+                )
+                return response.choices[0].message.content
+
+        # 非图片相关问题的处理
         local_results = self.knowledge.search(query)
         context = []
 
@@ -201,6 +294,76 @@ class MCPClient:
 
         return "\n".join(final_text)
 
+    async def _extract_questions(self, analysis_text: str) -> list:
+        """使用大模型从分析文本中提取结构化问题列表"""
+        extraction_prompt = """请严格按以下要求处理：
+1. 从文本中提取所有独立问题
+2. 忽略非问题陈述
+3. 用数字编号列表格式返回
+4. 保留原始问题表述
+
+示例输出：
+1. 如何准备留学申请材料？
+2. 推荐信应该包含哪些内容？"""
+
+        response = await self.openai.chat.completions.create(
+            model="gpt-4.1",
+            messages=[
+                {"role": "system", "content": extraction_prompt},
+                {"role": "user", "content": analysis_text}
+            ],
+            temperature=0.3,
+            max_tokens=500
+        )
+        
+        # 解析结构化结果
+        questions = []
+        for line in response.choices[0].message.content.split('\n'):
+            match = re.match(r'^(\d+)[\.、]?\s*([^\n?？]+[?？]?)', line.strip())
+            if match:
+                questions.append(match.group(2).strip())
+        return questions
+
+    async def _process_multiple_questions(self, questions: list) -> str:
+        """处理多个问题的工作流程"""
+        results = []
+        for idx, question in enumerate(questions, 1):
+            try:
+                # 预处理问题文本
+                clean_question = re.sub(r'^(\d+[\.、]?\s*)|[\s　]+', '', question).strip()
+                
+                # 本地知识库查询（提升查询容错性）
+                local_results = self.knowledge.search(clean_question)
+                
+                # 动态阈值策略：优先展示本地匹配结果
+                if local_results:
+                    best_match = max(local_results, key=lambda x: x['score'])
+                    if best_match['score'] >= 0.65:  # 调整相似度阈值
+                        results.append(f"问题{idx}【本地匹配】 a: {best_match['answer'].strip()}")
+                        continue
+
+                # 大模型生成回答
+                response = await self.openai.chat.completions.create(
+                    model="gpt-4.1",
+                    messages=[
+                        {"role": "system", "content": "你是一个专业的留学顾问，请用简洁准确的中文回答以下问题"},
+                        {"role": "user", "content": clean_question}
+                    ],
+                    temperature=0.5,
+                    max_tokens=500
+                )
+                generated_answer = response.choices[0].message.content.strip()
+                results.append(f"问题{idx}【大模型解答】 {generated_answer}")
+
+                # 防止速率限制
+                await asyncio.sleep(0.5)
+            
+            except Exception as e:
+                print(f"处理问题{idx}时出错: {str(e)}")
+                results.append(f"问题{idx}【处理失败】")
+        
+        return "\n\n".join(results)
+    
     async def chat_loop(self):
         """Run an interactive chat loop"""
         print("\nMCP Client Started!")
@@ -219,7 +382,7 @@ class MCPClient:
                     continue
                 elif query.lower() == 'image':
                     image_path = input("Enter image file path: ").strip()
-                    print("请输入您对图片的问题(直接回车将执行默认分析):")
+                    print("请输入您对图片的问题(直接回车执行默认分析):")
                     image_question = input().strip()
                     if not image_question:
                         image_question = "请分析这张图片的内容，并提供详细描述。"
